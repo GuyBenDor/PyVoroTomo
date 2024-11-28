@@ -677,10 +677,11 @@ class InversionIterator(object):
 
             # Remove outliers.
             arrivals = remove_outliers(arrivals, tukey_k, "residual")
-
+            min_arr = min([len(arrivals),narrival])
+            arrivals = arrivals.sample(n=min_arr, weights="weight", replace=False)
             # Sample arrivals.
-            replace = True if narrival > len(arrivals) else False
-            arrivals = arrivals.sample(n=narrival, weights="weight", replace=replace)
+            # replace = True if narrival > len(arrivals) else False
+            # arrivals = arrivals.sample(n=narrival, weights="weight", replace=replace)
 
             self.sampled_arrivals = arrivals
 
@@ -700,7 +701,7 @@ class InversionIterator(object):
             nevent = self.cfg["algorithm"]["nevent"]
 
             # Sample events.
-            events = self.events.sample(n=nevent, weights=None)
+            events = self.events.sample(n=nevent, weights="weight")
 
             self.sampled_events = events
 
@@ -722,6 +723,7 @@ class InversionIterator(object):
         arrivals = self.sampled_arrivals
         arrivals = arrivals.set_index(["network", "station"])
         arrivals = arrivals.sort_index()
+        arrivals = arrivals.astype({'event_id':str})
 
         if RANK == ROOT_RANK:
 
@@ -731,7 +733,7 @@ class InversionIterator(object):
 
         else:
 
-            events = self.events
+            events = self.events.astype({'event_id':str})
             events = events.set_index("event_id")
             events["idx"] = range(len(events))
 
@@ -891,9 +893,115 @@ class InversionIterator(object):
 
         return (True)
 
+    @_utilities.log_errors(logger)
+    def _update_events_weights(
+        self,
+        npts: int=16,
+        bandwidth: float=0.1
+    ) -> bool:
+        """
+        Update events weights using KDE.
+        """
+
+        logger.info("Updating event weights for homogeneous raypath sampling.")
+
+        if RANK == ROOT_RANK:
+
+            # Merge event data.
+            events = self.events#.astype({"event_id":str})
+            
+            cols = list(set(list(events.columns) + ["weight"]))
+            
+            niter = self.cfg["algorithm"]["niter"]
+            weight_scheme = self.cfg["algorithm"]["weight_scheme"]
+            earthquake_coverage = self.cfg["algorithm"]["earthquake_coverage"]
+            arrivals = self.arrivals#.astype({"event_id":str})
+            stations = self.stations.rename(
+                columns={
+                    "latitude": "station_latitude",
+                    "longitude": "station_longitude"
+                }
+            )
+            
+            
+            merge_event_columns = [
+                "event_id",
+                "latitude",
+                "longitude"
+            ]
+            arrivals = arrivals.merge(events[merge_event_columns],on="event_id")
+            
+            
+            merge_station_columns = [
+                "network",
+                "station",
+                "station_latitude",
+                "station_longitude"
+            ]
+            arrivals = arrivals.merge(stations[merge_station_columns],on=["station","network"])
+            dlat = arrivals["latitude"] - arrivals["station_latitude"]
+            dlon = arrivals["longitude"] - arrivals["station_longitude"]
+            arrivals["azimuth"] = np.degrees(np.arctan2(dlon,dlat))%360
+
+            
+            result = arrivals.groupby('event_id').apply(get_gap).reset_index(name='gap')
+            if 'gap' in events.columns.values:
+                events.drop(columns='gap',inplace=True)
+            events = events.merge(result,on="event_id")
+            events['coverage_normalized'] = (360-events['gap'])/360
+
+            # Extract the data for KDE fitting.
+            kde_columns = [
+                "latitude",
+                "longitude",
+                "depth"
+            ]
+            ndim = len(kde_columns)
+            data = events[kde_columns].values
+
+            # Normalize the data.
+            data_min = data.min(axis=0)
+            data_max = data.max(axis=0)
+            data_range = data_max - data_min
+            data_range[data_range == 0] = 1e-5 #failsafe
+            data_delta = data - data_min
+            data = data_delta / data_range
+
+            # Fit and evaluate the KDE.
+            kde = kp.FFTKDE(bw=bandwidth).fit(data)
+            points, values = kde.evaluate(npts)
+            points = [np.unique(points[:,iax]) for iax in range(ndim)]
+            values = values.reshape((npts,) * ndim)
+
+            # Initialize an interpolator because FFTKDE is evaluated on a
+            # regular grid.
+            interpolator = scipy.interpolate.RegularGridInterpolator(points, values)
+
+            # Assign weights to the arrivals.
+            if self.iiter<=weight_scheme[0]:
+                events["weight"] = 1.0 / np.exp(interpolator(data))
+            elif weight_scheme[0]<self.iiter<=weight_scheme[1]:
+                events["weight"] = 1.0 / np.sqrt(interpolator(data))
+            else:
+                events["weight"] = 1.0
+            
+            if self.iiter in weight_scheme[2:]:
+                events.loc[events.coverage_normalized<earthquake_coverage,"weight"] = events.weight.min()
+                
+#            if self.iiter==1:
+#                events['sampling_count'] = 0
+            
+            events = events[cols]
+            
+            self.events = events
+
+        self.synchronize(attrs=["events"])
+
+        return (True)
+
 
     @_utilities.log_errors(logger)
-    def _update_projection_matrix(self):
+    def _update_projection_matrix(self, hvr):
         """
         Update the projection matrix using the current Voronoi cells.
         """
@@ -903,7 +1011,7 @@ class InversionIterator(object):
         if RANK == ROOT_RANK:
 
             nvoronoi = len(self.voronoi_cells)
-            hvr = self.cfg["algorithm"]["hvr"]
+            # hvr = self.cfg["algorithm"]["hvr"]
             min_coords = self.pwave_model.min_coords
             max_coords = self.pwave_model.max_coords
             center = (min_coords + max_coords) / 2
@@ -1019,15 +1127,23 @@ class InversionIterator(object):
         output_dir = self.argc.output_dir
 
         niter = self.cfg["algorithm"]["niter"]
-        kvoronoi = self.cfg["algorithm"]["kvoronoi"]
-        nvoronoi = self.cfg["algorithm"]["nvoronoi"]
+        kvoronois = self.cfg["algorithm"]["kvoronois"]
+        nvoronois = self.cfg["algorithm"]["nvoronois"]
+        hvrs = self.cfg["algorithm"]["hvrs"]
         nreal = self.cfg["algorithm"]["nreal"]
         relocation_method = self.cfg["relocate"]["method"]
+        alpha = self.cfg["algorithm"]["paretos_alpha"]
+        
+        
+        kvoronoi = kvoronois[self.iiter]
+        nvoronoi = nvoronois[self.iiter]
+        hvr = hvrs[self.iiter]
 
         self.iiter += 1
 
+        
         logger.info(f"Iteration #{self.iiter} (/{niter}).")
-
+        self._update_events_weights()
         for phase in self.phases:
             logger.info(f"Updating {phase}-wave model")
             self._reset_realization_stack(phase)
@@ -1040,10 +1156,11 @@ class InversionIterator(object):
                 self._generate_voronoi_cells(
                     phase,
                     kvoronoi,
-                    nvoronoi
+                    nvoronoi,
+                    alpha
                 )
-                self._update_projection_matrix()
-                self._compute_sensitivity_matrix(phase)
+                self._update_projection_matrix(hvr)
+                self._compute_sensitivity_matrix(phase, hvr)
                 self._compute_model_update(phase)
             self.update_model(phase)
             self.save_model(phase)
@@ -1305,14 +1422,26 @@ class InversionIterator(object):
         logger.info("Relocating events.")
 
         if RANK == ROOT_RANK:
-            ids = self.events["event_id"]
+            ids = self.events.astype({'event_id':str})["event_id"]
+            
             self._dispatch(sorted(ids))
 
             logger.debug("Dispatch complete. Gathering events.")
+            
             # Gather and concatenate events from all workers.
             events = COMM.gather(None, root=ROOT_RANK)
+            
             events = pd.concat(events, ignore_index=True)
-            events = events.convert_dtypes()
+            
+            events = events.sort_values(by="event_id",ignore_index=True).astype({
+                "latitude":float,
+                "longitude":float,
+                "depth":float,
+                "time":float,
+                "residual":float,
+                "event_id":int
+            })
+                
             self.events = events
 
         else:
@@ -1331,7 +1460,7 @@ class InversionIterator(object):
             _path = self.traveltime_inventory_path
             _station_dict = station_dict(self.stations)
 
-            with pykonal.locate.EQLocator(_station_dict, _path) as locator:
+            with pykonal.locate.EQLocator(_path) as locator:
 
                 # Create some aliases for configuration-file parameters.
                 depth_min = self.cfg["relocate"]["depth_min"]
@@ -1349,7 +1478,7 @@ class InversionIterator(object):
                 # Initialize the search region.
                 delta = np.array([dz, dtheta, dphi, dt])
 
-                events = self.events
+                events = self.events.astype({"event_id": str})
                 events = events.set_index("event_id")
 
                 # Initialize empty DataFrame for updated event locations.
@@ -1359,8 +1488,8 @@ class InversionIterator(object):
 
                     # Request an event
                     event_id = self._request_dispatch()
-
                     if event_id is None:
+                        
                         logger.debug("Received sentinel, gathering events.")
                         COMM.gather(relocated_events, root=ROOT_RANK)
 
@@ -1371,18 +1500,19 @@ class InversionIterator(object):
                     # Extract the initial event location and convert to
                     # spherical coordinates.
                     _columns = ["latitude", "longitude", "depth", "time"]
-                    initial = events.loc[event_id, _columns].values
+                    initial = events.loc[str(event_id), _columns].values
                     initial[:3] = geo2sph(initial[:3])
 
                     # Clear previous event's arrivals from EQLocator.
                     locator.clear_arrivals()
 
                     # Update EQLocator with arrivals for this event.
-                    _arrivals = arrival_dict(self.arrivals, event_id)
+                    _arrivals = arrival_dict(self.arrivals.astype({"event_id": str}), str(event_id))
                     locator.add_arrivals(_arrivals)
-
+                    initial = np.array(list(initial))
                     # Relocate the event.
                     loc = locator.locate(initial, delta)
+                    
                     loc[0] = min(loc[0], rho_max)
 
                     # Get residual RMS, reformat result, and append to
@@ -1390,10 +1520,12 @@ class InversionIterator(object):
                     rms = locator.rms(loc)
                     loc[:3] = sph2geo(loc[:3])
                     event = pd.DataFrame(
-                        [np.concatenate((loc, [rms, event_id]))],
+                        [np.concatenate((loc, [rms, str(event_id)]))],
                         columns=columns
                     )
-                    relocated_events = relocated_events.append(event, ignore_index=True)
+                    relocated_events = pd.concat([relocated_events,event], ignore_index=True)
+#                    print(len(relocated_events))
+#                    print(event)
 
         self.synchronize(attrs=["events"])
 
@@ -1650,7 +1782,13 @@ class InversionIterator(object):
                         last_handle = handle
 
                     _arrivals = arrivals.loc[(network, station, phase)]
+                    # print("________")
+                    # print(_arrivals.dtypes)
+                    # print(events.dtypes)
+
+                
                     _events = events.loc[_arrivals["event_id"].values]
+                
                     arrival_times = _arrivals["time"].values
 
                     origin_times = _events["time"].values
@@ -1666,7 +1804,7 @@ class InversionIterator(object):
                         residual=residuals
                     )
                     _arrivals = pd.DataFrame(_arrivals)
-                    updated_arrivals = updated_arrivals.append(_arrivals, ignore_index=True)
+                    updated_arrivals = pd.concat([updated_arrivals,_arrivals], ignore_index=True)
 
         self.synchronize(attrs=["arrivals"])
 
@@ -1769,3 +1907,43 @@ def station_dict(dataframe):
     }
 
     return (_station_dict)
+
+def dist_on_unit_sphere(lat1, lon1, lat2, lon2):
+    # Convert latitude and longitude from decimal degrees to radians
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    theta1 = np.radians(lon1)
+    theta2 = np.radians(lon2)
+
+    # Calculate the spherical distance from the law of cosines
+    dtheta = theta2 - theta1
+    delta_phi = phi2 - phi1
+    a = np.sin(delta_phi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dtheta/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return np.degrees(c)
+
+def dist_km(lat1, lon1, lat2, lon2):
+    # Convert latitude and longitude from decimal degrees to radians
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    delta_phi = np.radians(lat2 - lat1)
+    delta_lon = np.radians(lon2 - lon1)
+
+    # Calculate the spherical distance using the Haversine formula
+    a = np.sin(delta_phi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(delta_lon/2)**2
+    distance = 6371 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return distance
+
+def get_gap(tmp):
+    # Finds the largest station coverage gap around an event
+    sorted_azimuths = tmp.sort_values(by="azimuth").copy()
+    sorted_azimuths["Diff"] = np.nan
+    sorted_azimuths.loc[sorted_azimuths.index,"Diff"] = sorted_azimuths.azimuth.diff().dropna()
+    sorted_azimuths.loc[sorted_azimuths.index[0],"Diff"] = circular_gap = 360 - (sorted_azimuths.iloc[-1].azimuth - sorted_azimuths.iloc[0].azimuth)
+    return sorted_azimuths["Diff"].max()
+
+def sample_some_arrivals(df, n):
+    if n>=len(df):
+        return df
+    else:
+        return df.sample(n=n, replace=False, weights='weight')
