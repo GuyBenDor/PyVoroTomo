@@ -359,7 +359,7 @@ class InversionIterator(object):
 
 
     @_utilities.log_errors(logger)
-    def _compute_sensitivity_matrix(self, phase):
+    def _compute_sensitivity_matrix(self, phase, hvr):
         """
         Compute the sensitivity matrix.
         """
@@ -372,6 +372,7 @@ class InversionIterator(object):
         arrivals = self.sampled_arrivals.set_index(index_keys)
 
         arrivals = arrivals.sort_index()
+        arrivals = arrivals.astype({"event_id":str})
 
         if RANK == ROOT_RANK:
 
@@ -420,7 +421,7 @@ class InversionIterator(object):
             residuals = np.array([], dtype=_constants.DTYPE_REAL)
 
             step_size = self.step_size
-            events = self.events.set_index("event_id")
+            events = self.events.astype({"event_id":str}).set_index("event_id")
             events["idx"] = range(len(events))
 
             while True:
@@ -456,7 +457,7 @@ class InversionIterator(object):
                     raypath = raypath_file[phase][:, idx]
                     raypath = np.stack(raypath).T
 
-                    _column_idxs, counts = self._projected_ray_idxs(raypath)
+                    _column_idxs, counts = self._projected_ray_idxs(raypath, hvr)
                     column_idxs = np.append(column_idxs, _column_idxs)
                     nsegments = np.append(nsegments, len(_column_idxs))
                     nonzero_values = np.append(nonzero_values, counts * step_size)
@@ -503,7 +504,7 @@ class InversionIterator(object):
 
 
     @_utilities.log_errors(logger)
-    def _generate_voronoi_cells(self, phase, kvoronoi, nvoronoi):
+    def _generate_voronoi_cells(self, phase, kvoronoi, nvoronoi, alpha):
         """
         Generate Voronoi cells using k-medians clustering of raypaths.
         """
@@ -519,7 +520,24 @@ class InversionIterator(object):
             max_coords = self.pwave_model.max_coords
 
             delta = max_coords - min_coords
-            base_cells = np.random.rand(nvoronoi, 3) * delta  +  min_coords
+            
+            if alpha == 0:
+                rho = np.random.rand(nvoronoi, 1) * delta[0] + min_coords[0]
+                
+            else:
+                rho_base = np.random.rand(nvoronoi-kvoronoi, 1) * delta[0] + min_coords[0]
+                #rho_refine = max_coords[0] - np.random.pareto(alpha, size=(kvoronoi, 1)) * delta[0]
+                randpts = np.random.gamma(2.0, alpha, size = (kvoronoi,1))
+                randpts = randpts / randpts.max()
+                rho_refine = max_coords[0] - randpts * delta[0]
+                # rho = np.vstack([rho_base,rho_refine[::-1]])
+                rho = np.vstack([rho_base,rho_refine])
+                
+            theta_phi = np.random.rand(nvoronoi, 2) * delta[1:]  +  min_coords[1:]
+
+            base_cells = np.hstack([rho, theta_phi])
+            
+            # base_cells = np.random.rand(nvoronoi, 3) * delta  +  min_coords
 
             self.voronoi_cells = base_cells
 
@@ -574,13 +592,13 @@ class InversionIterator(object):
 
 
     @_utilities.log_errors(logger)
-    def _projected_ray_idxs(self, raypath):
+    def _projected_ray_idxs(self, raypath, hvr):
         """
         Return the cell IDs (column IDs) of each segment of the given
         raypath and the length of each segment in counts.
         """
 
-        hvr = self.cfg["algorithm"]["hvr"]
+        # hvr = self.cfg["algorithm"]["hvr"]
         min_coords = self.pwave_model.min_coords
         max_coords = self.pwave_model.max_coords
         center = (min_coords + max_coords) / 2
