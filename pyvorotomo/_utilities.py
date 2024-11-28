@@ -250,21 +250,37 @@ def parse_cfg(configuration_file):
         "niter",
         fallback=1
     )
-    _cfg["kvoronoi"] = parser.getint(
-        "algorithm",
-        "kvoronoi"
-    )
-    _cfg["nvoronoi"] = parser.getint(
-        "algorithm",
-        "nvoronoi"
-    )
-    _cfg["hvr"] = parser.getfloat(
-        "algorithm",
-        "hvr"
-    )
+    _cfg["kvoronois"] = [int(v) for v in parser.get(
+            "algorithm",
+            "kvoronoi"
+        ).split(",")
+    ]
+    _cfg["nvoronois"] = [int(v) for v in parser.get(
+            "algorithm",
+            "nvoronoi"
+        ).split(",")
+    ]
+    _cfg["hvrs"] = [float(v) for v in parser.get(
+            "algorithm",
+            "hvr"
+        ).split(",")
+    ]
+    _cfg["weight_scheme"] = [int(v) for v in parser.get(
+            "algorithm",
+            "weight_scheme"
+        ).split(",")
+    ]
     _cfg["nreal"] = parser.getint(
         "algorithm",
         "nreal"
+    )
+     _cfg["paretos_alpha"] = parser.getfloat(
+        "algorithm",
+        "paretos_alpha"
+    )
+    _cfg["earthquake_coverage"] = parser.getfloat(
+        "algorithm",
+        "earthquake_coverage"
     )
     _cfg["k_medians_npts"] = parser.getint(
         "algorithm",
