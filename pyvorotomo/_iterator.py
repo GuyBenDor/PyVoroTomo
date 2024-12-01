@@ -170,7 +170,7 @@ class InversionIterator(object):
             if "pwave_stack" not in self._f5_workspace:
                 self._f5_workspace.create_dataset(
                     "pwave_stack",
-                    shape=(self.cfg["algorithm"]["nreal"], *self.pwave_model.npts),
+                    shape=(len(self.cfg["algorithm"]["hvrs"])*self.cfg["algorithm"]["nreal"], *self.pwave_model.npts),
                     dtype=_constants.DTYPE_REAL,
                     fillvalue=np.nan
                 )
@@ -265,7 +265,7 @@ class InversionIterator(object):
             if "swave_stack" not in self._f5_workspace:
                 self._f5_workspace.create_dataset(
                     "swave_stack",
-                    shape=(self.cfg["algorithm"]["nreal"], *self.pwave_model.npts),
+                    shape=(len(self.cfg["algorithm"]["hvrs"])*self.cfg["algorithm"]["nreal"], *self.pwave_model.npts),
                     dtype=_constants.DTYPE_REAL,
                     fillvalue=np.nan
                 )
@@ -691,17 +691,18 @@ class InversionIterator(object):
 
 
     @_utilities.log_errors(logger)
-    def _sample_events(self):
+    def _sample_events(self, nevent):
         """
         Draw a random sample of events and update the
         "sampled_events" attribute.
         """
 
         if RANK == ROOT_RANK:
-            nevent = self.cfg["algorithm"]["nevent"]
 
             # Sample events.
-            events = self.events.sample(n=nevent, weights="weight")
+            events = self.events
+            nevent = min([len(events),nevent])
+            events = events.sample(n=nevent, weights="weight")
 
             self.sampled_events = events
 
@@ -981,12 +982,14 @@ class InversionIterator(object):
             if self.iiter<=weight_scheme[0]:
                 events["weight"] = 1.0 / np.exp(interpolator(data))
             elif weight_scheme[0]<self.iiter<=weight_scheme[1]:
-                events["weight"] = 1.0 / np.sqrt(interpolator(data))
+                events["weight"] = 1.0 / interpolator(data)
+            elif weight_scheme[1]<self.iiter<=weight_scheme[2]:
+                events["weight"] = 1.0 / np.log(1+interpolator(data))
             else:
                 events["weight"] = 1.0
             
-            if self.iiter in weight_scheme[2:]:
-                events.loc[events.coverage_normalized<earthquake_coverage,"weight"] = events.weight.min()
+            if self.iiter in earthquake_coverage[1:]:
+                events.loc[events.coverage_normalized<earthquake_coverage[0],"weight"] = events.weight.min()
                 
 #            if self.iiter==1:
 #                events['sampling_count'] = 0
@@ -1133,11 +1136,12 @@ class InversionIterator(object):
         nreal = self.cfg["algorithm"]["nreal"]
         relocation_method = self.cfg["relocate"]["method"]
         alpha = self.cfg["algorithm"]["paretos_alpha"]
+        add_variability = self.cfg["algorithm"]["add_variability"]
+        nevent = self.cfg["algorithm"]["nevent"]
         
         
         kvoronoi = kvoronois[self.iiter]
         nvoronoi = nvoronois[self.iiter]
-        hvr = hvrs[self.iiter]
 
         self.iiter += 1
 
@@ -1148,20 +1152,33 @@ class InversionIterator(object):
             logger.info(f"Updating {phase}-wave model")
             self._reset_realization_stack(phase)
             self._update_arrival_weights(phase)
-            for self.ireal in range(nreal):
-                logger.info(f"Realization #{self.ireal+1} (/{nreal}).")
-                self._sample_events()
-                self._sample_arrivals(phase)
-                self._trace_rays(phase)
-                self._generate_voronoi_cells(
-                    phase,
-                    kvoronoi,
-                    nvoronoi,
-                    alpha
-                )
-                self._update_projection_matrix(hvr)
-                self._compute_sensitivity_matrix(phase, hvr)
-                self._compute_model_update(phase)
+            self.ireal = 0
+            for hvr in hvrs:
+                for _ in range(nreal):
+                    logger.info(f"Realization #{self.ireal+1} (/{nreal}).")
+
+                    var1 = np.random.uniform(0.9, 1.1) if add_variability else 1
+                    var2 = np.random.uniform(0.9, 1.1) if add_variability else 1
+                    var3 = np.random.uniform(0.9, 1.1) if add_variability else 1
+                    alp = np.random.randint(0, alpha+1) if add_variability else alpha
+                    kvor = int(kvoronoi*var1)
+                    nvor = int(nvoronoi*var2)
+                    nev = int(nevent*var3)
+                    
+                    self._sample_events(nev)
+                    self._sample_arrivals(phase)
+                    self._trace_rays(phase)
+                    self._generate_voronoi_cells(
+                        phase,
+                        kvor,
+                        nvor,
+                        alp
+                    )
+                    self._update_projection_matrix(hvr)
+                    self._compute_sensitivity_matrix(phase, hvr)
+                    self._compute_model_update(phase)
+                    self.ireal += 1
+                    
             self.update_model(phase)
             self.save_model(phase)
         self.compute_traveltime_lookup_tables()
