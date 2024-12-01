@@ -278,10 +278,11 @@ def parse_cfg(configuration_file):
         "algorithm",
         "paretos_alpha"
     )
-    _cfg["earthquake_coverage"] = parser.getfloat(
-        "algorithm",
-        "earthquake_coverage"
-    )
+    _cfg["earthquake_coverage"] = [float(v) for v in parser.get(
+            "algorithm",
+            "earthquake_coverage"
+        ).split(",")
+    ]
     _cfg["k_medians_npts"] = parser.getint(
         "algorithm",
         "k_medians_npts"
