@@ -265,10 +265,9 @@ def parse_cfg(configuration_file):
             "hvr"
         ).split(",")
     ]
-    _cfg["weight_scheme"] = [int(v) for v in parser.get(
-            "algorithm",
-            "weight_scheme"
-        ).split(",")
+    v_str = parser.get("algorithm", "weight_scheme")
+    _cfg["weight_scheme"] = [
+        [int(num) for num in group.split(',')] for group in v_str.split('|')
     ]
     _cfg["nreal"] = parser.getint(
         "algorithm",
@@ -307,6 +306,14 @@ def parse_cfg(configuration_file):
         "algorithm",
         "outlier_removal_factor"
     )
+    _cfg["max_event_residual"] = parser.getfloat(
+        "algorithm",
+        "max_event_residual"
+    )
+    _cfg["max_arrival_residual"] = parser.getfloat(
+        "algorithm",
+        "max_arrival_residual"
+    )
     _cfg["damp"] = parser.getfloat(
         "algorithm",
         "damp"
@@ -344,6 +351,14 @@ def parse_cfg(configuration_file):
     )
     initial_swave_path = os.path.abspath(initial_swave_path)
     _cfg["initial_swave_path"] = initial_swave_path
+
+    initial_psr_path = parser.get(
+        "model",
+        "initial_psr_path"
+    )
+    initial_psr_path = os.path.abspath(initial_psr_path)
+    _cfg["initial_psr_path"] = initial_psr_path
+
     cfg["model"] = _cfg
 
     _cfg = dict()
