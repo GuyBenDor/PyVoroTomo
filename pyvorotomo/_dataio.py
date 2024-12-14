@@ -83,6 +83,7 @@ def parse_velocity_models(cfg):
 
     pwave_model = _picklable.ScalarField3D(coord_sys="spherical")
     swave_model = _picklable.ScalarField3D(coord_sys="spherical")
+    psr_model = _picklable.ScalarField3D(coord_sys="spherical")
 
 
     path = cfg["model"]["initial_pwave_path"]
@@ -90,13 +91,16 @@ def parse_velocity_models(cfg):
 
     path = cfg["model"]["initial_swave_path"]
     _swave_model = pykonal.fields.read_hdf(path)
+    
+    path = cfg["model"]["initial_psr_path"]
+    _psr_model = pykonal.fields.read_hdf(path)
 
-    models  = (pwave_model, swave_model)
-    _models = (_pwave_model, _swave_model)
+    models  = (pwave_model, swave_model, psr_model)
+    _models = (_pwave_model, _swave_model, _psr_model)
     for model, _model in zip(models, _models):
         model.min_coords = _model.min_coords
         model.node_intervals = _model.node_intervals
         model.npts = _model.npts
         model.values = _model.values
 
-    return (pwave_model, swave_model)
+    return (pwave_model, swave_model, psr_model)
