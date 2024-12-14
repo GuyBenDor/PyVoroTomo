@@ -53,10 +53,13 @@ class InversionIterator(object):
         self._projection_matrix = None
         self._pwave_model = None
         self._swave_model = None
+        self._psr_model = None
         self._pwave_realization_stack = None
         self._swave_realization_stack = None
+        self._psr_realization_stack = None
         self._pwave_variance = None
         self._swave_variance = None
+        self._psr_variance = None
         self._residuals = None
         self._sensitivity_matrix = None
         self._stations = None
@@ -285,7 +288,42 @@ class InversionIterator(object):
         var = np.var(stack, axis=0)
         field.values = var
         return (field)
+ 
+    @property
+    def psr_model(self):
+        return (self._psr_model)
 
+    @psr_model.setter
+    def psr_model(self, value):
+        self._psr_model = value
+
+    @property
+    def psr_realization_stack(self):
+        if RANK == ROOT_RANK:
+            if "psr_stack" not in self._f5_workspace:
+                self._f5_workspace.create_dataset(
+                    "psr_stack",
+                    shape=(len(self.cfg["algorithm"]["hvrs"])*self.cfg["algorithm"]["nreal"], *self.pwave_model.npts),
+                    dtype=_constants.DTYPE_REAL,
+                    fillvalue=np.nan
+                )
+
+            return (self._f5_workspace["psr_stack"])
+
+        return (None)
+
+    @property
+    def psr_variance(self) -> _picklable.ScalarField3D:
+        field = _picklable.ScalarField3D(coord_sys="spherical")
+        field.min_coords = self.psr_model.min_coords
+        field.node_intervals = self.psr_model.node_intervals
+        field.npts = self.psr_model.npts
+        stack = self._f5_workspace["psr_stack"]
+        stack = np.ma.masked_invalid(stack)
+        var = np.var(stack, axis=0)
+        field.values = var
+        return (field)
+        
     @property
     def traveltime_dir(self):
         return (os.path.join(self.scratch_dir, "traveltimes"))
@@ -345,7 +383,8 @@ class InversionIterator(object):
         logger.info(f"||m||         = {normx:8.1f}")
         logger.info(f"||G^-1||||G|| = {conda:8.1f}")
 
-        delta_slowness = self.projection_matrix * x
+        nvoronoi = len(self.voronoi_cells)
+        delta_slowness = self.projection_matrix * x[:nvoronoi]
         delta_slowness = delta_slowness.reshape(model.npts)
         slowness = np.power(model.values, -1) + delta_slowness
         velocity = np.power(slowness, -1)
@@ -354,6 +393,7 @@ class InversionIterator(object):
             self.pwave_realization_stack[self.ireal] = velocity
         else:
             self.swave_realization_stack[self.ireal] = velocity
+            self.psr_realization_stack[self.ireal] = self.pwave_realization_stack[self.ireal]/self.swave_realization_stack[self.ireal]
 
         return (True)
 
@@ -649,6 +689,11 @@ class InversionIterator(object):
         stack = getattr(self, handle)
         stack[:] = np.nan
 
+        if phase=="s":
+            handle = f"psr_realization_stack"
+            stack = getattr(self, handle)
+            stack[:] = np.nan
+            
         return (True)
 
 
@@ -661,6 +706,7 @@ class InversionIterator(object):
 
         if RANK == ROOT_RANK:
             tukey_k = self.cfg["algorithm"]["outlier_removal_factor"]
+            max_arr_resid = self.cfg["algorithm"]["max_arrival_residual"] #NEW
             narrival = self.cfg["algorithm"]["narrival"]
 
             # Subset for the arrivals associated with sampled events.
@@ -676,7 +722,8 @@ class InversionIterator(object):
             arrivals = arrivals.loc[phase]
 
             # Remove outliers.
-            arrivals = remove_outliers(arrivals, tukey_k, "residual")
+            # arrivals = remove_outliers(arrivals, tukey_k, "residual")
+            arrivals = remove_outliers(arrivals, tukey_k, "residual", max_arr_resid)
             min_arr = min([len(arrivals),narrival])
             arrivals = arrivals.sample(n=min_arr, weights="weight", replace=False)
             # Sample arrivals.
@@ -701,12 +748,19 @@ class InversionIterator(object):
 
             # Sample events.
             events = self.events
+            max_evt_resid = self.cfg["algorithm"]["max_event_residual"] #NEW
+
+            events = remove_outliers(events, None, "residual", max_evt_resid) #NEW
+            
             nevent = min([len(events),nevent])
             events = events.sample(n=nevent, weights="weight")
 
             self.sampled_events = events
+            sampled_indices = self.sampled_events.index
+            
+            self.events.loc[sampled_indices,"sampling_count"]+=1
 
-        self.synchronize(attrs=["sampled_events"])
+        self.synchronize(attrs=["sampled_events", "events"])
 
         return (True)
 
@@ -979,20 +1033,20 @@ class InversionIterator(object):
             interpolator = scipy.interpolate.RegularGridInterpolator(points, values)
 
             # Assign weights to the arrivals.
-            if self.iiter<=weight_scheme[0]:
+            if self.iiter in weight_scheme[0]:
                 events["weight"] = 1.0 / np.exp(interpolator(data))
-            elif weight_scheme[0]<self.iiter<=weight_scheme[1]:
+            elif self.iiter in weight_scheme[1]:
                 events["weight"] = 1.0 / interpolator(data)
-            elif weight_scheme[1]<self.iiter<=weight_scheme[2]:
+            elif self.iiter in weight_scheme[2]:
                 events["weight"] = 1.0 / np.log(1+interpolator(data))
-            else:
+            elif self.iiter in weight_scheme[3]:
                 events["weight"] = 1.0
             
             if self.iiter in earthquake_coverage[1:]:
                 events.loc[events.coverage_normalized<earthquake_coverage[0],"weight"] = events.weight.min()
                 
-#            if self.iiter==1:
-#                events['sampling_count'] = 0
+           if self.iiter==1:
+               events['sampling_count'] = 0
             
             events = events[cols]
             
@@ -1274,10 +1328,10 @@ class InversionIterator(object):
 
             # Parse velocity model files.
             velocity_models = _dataio.parse_velocity_models(self.cfg)
-            self.pwave_model, self.swave_model = velocity_models
+            self.pwave_model, self.swave_model, self.psr_model = velocity_models
             self.step_size = self.pwave_model.step_size
 
-        self.synchronize(attrs=["pwave_model", "swave_model", "step_size"])
+        self.synchronize(attrs=["pwave_model", "swave_model","psr_model", "step_size"])
 
         return (True)
 
@@ -1456,9 +1510,24 @@ class InversionIterator(object):
                 "depth":float,
                 "time":float,
                 "residual":float,
-                "event_id":int
+                "event_id":int,
+                "sampling_count": int
             })
-                
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            
             self.events = events
 
         else:
@@ -1469,7 +1538,8 @@ class InversionIterator(object):
                 "depth",
                 "time",
                 "residual",
-                "event_id"
+                "event_id",
+                "sampling_count"
             ]
 
 
@@ -1517,7 +1587,9 @@ class InversionIterator(object):
                     # Extract the initial event location and convert to
                     # spherical coordinates.
                     _columns = ["latitude", "longitude", "depth", "time"]
-                    initial = events.loc[str(event_id), _columns].values
+                    
+                    event = events.loc[str(event_id)]
+                    initial = event[_columns].values
                     initial[:3] = geo2sph(initial[:3])
 
                     # Clear previous event's arrivals from EQLocator.
@@ -1537,7 +1609,7 @@ class InversionIterator(object):
                     rms = locator.rms(loc)
                     loc[:3] = sph2geo(loc[:3])
                     event = pd.DataFrame(
-                        [np.concatenate((loc, [rms, str(event_id)]))],
+                        [np.concatenate((loc, [rms, str(event_id), int(event.sampling_count)]))],
                         columns=columns
                     )
                     relocated_events = pd.concat([relocated_events,event], ignore_index=True)
@@ -1691,6 +1763,11 @@ class InversionIterator(object):
         model = getattr(self, handle)
         model.to_hdf(path + f".{handle}.h5")
 
+        if phase=='s':
+            handle = f"psr_model"
+            model = getattr(self, handle)
+            model.to_hdf(path + f".{handle}.h5")
+            
         if self.iiter == 0:
 
             return (True)
@@ -1699,6 +1776,11 @@ class InversionIterator(object):
         model = getattr(self, handle)
         model.to_hdf(path + f".{handle}.h5")
 
+        if phase=='s':
+            handle = f"psr_variance"
+            model = getattr(self, handle)
+            model.to_hdf(path + f".{handle}.h5")
+            
         if self.argc.output_realizations is True:
             handle = f"{phase}wave_realization_stack"
             stack = getattr(self, handle)
@@ -1727,6 +1809,7 @@ class InversionIterator(object):
             "projection_matrix",
             "pwave_model",
             "swave_model",
+            "psr_model",
             "sampled_arrivals",
             "stations",
             "step_size",
@@ -1756,9 +1839,8 @@ class InversionIterator(object):
 
         logger.info("Updating arrival residuals.")
 
-        arrivals = self.arrivals.set_index(["network", "station", "phase"])
+        arrivals = self.arrivals.astype({"event_id":str}).set_index(["network", "station", "phase"])
         arrivals = arrivals.sort_index()
-
         if RANK == ROOT_RANK:
             ids = arrivals.index.unique()
             self._dispatch(ids)
@@ -1770,7 +1852,7 @@ class InversionIterator(object):
 
         else:
 
-            events = self.events.set_index("event_id")
+            events = self.events.astype({"event_id":str}).set_index("event_id")
             updated_arrivals = pd.DataFrame()
 
             last_handle = None
@@ -1808,7 +1890,7 @@ class InversionIterator(object):
                 
                     arrival_times = _arrivals["time"].values
 
-                    origin_times = _events["time"].values
+                    origin_times = _events["time"].astype(float).values
                     coords = _events[["latitude", "longitude", "depth"]].values
                     coords = geo2sph(coords)
                     residuals = arrival_times - (origin_times + traveltime.resample(coords))
@@ -1851,7 +1933,25 @@ class InversionIterator(object):
             model = getattr(self, handle)
             model.values = variance
 
+            if phase=="s":
+                stackps = getattr(self, "psr_realization_stack")
+#                stackps = stackp.values/stack.values
+                valuesps = np.median(stackps, axis=0)
+                varianceps = np.var(stackps, axis=0)
+                
+                handleps = f"psr_model"
+                modelpsr = getattr(self, handleps)
+                modelpsr.values = valuesps
+                
+                handle = f"psr_variance"
+                modelpsr = getattr(self, handle)
+                modelpsr.values = varianceps
+                
+        
         attrs = [f"{phase}wave_model"]
+        if phase=="s":
+            attrs.append("psr_model")
+            
         self.synchronize(attrs=attrs)
 
         return (True)
@@ -1880,22 +1980,42 @@ def arrival_dict(dataframe, event_id):
 
     return (_arrival_dict)
 
-
-def remove_outliers(dataframe, tukey_k, column):
+def remove_outliers(dataframe, tukey_k, column, max_resid=0):
     """
     Return DataFrame with outliers removed using Tukey fences.
     """
-
-    q1, q3 = dataframe[column].quantile(q=[0.25, 0.75])
-    iqr = q3 - q1
-    vmin = q1 - tukey_k * iqr
-    vmax = q3 + tukey_k * iqr
-    dataframe = dataframe[
-         (dataframe[column] > vmin)
-        &(dataframe[column] < vmax)
-    ]
+    if max_resid!=0:
+        dataframe = dataframe[
+                 ((dataframe[column] <= max_resid) & (dataframe[column] >= -max_resid)) |
+                 (dataframe[column].isna())
+                              ]
+    if tukey_k:
+        q1, q3 = dataframe[column].quantile(q=[0.25, 0.75])
+        iqr = q3 - q1
+        vmin = q1 - tukey_k * iqr
+        vmax = q3 + tukey_k * iqr
+        dataframe = dataframe[
+             (dataframe[column] > vmin)
+            &(dataframe[column] < vmax)
+        ]
 
     return (dataframe)
+    
+# def remove_outliers(dataframe, tukey_k, column):
+#     """
+#     Return DataFrame with outliers removed using Tukey fences.
+#     """
+
+#     q1, q3 = dataframe[column].quantile(q=[0.25, 0.75])
+#     iqr = q3 - q1
+#     vmin = q1 - tukey_k * iqr
+#     vmax = q3 + tukey_k * iqr
+#     dataframe = dataframe[
+#          (dataframe[column] > vmin)
+#         &(dataframe[column] < vmax)
+#     ]
+
+#     return (dataframe)
 
 
 @_utilities.log_errors(logger)
